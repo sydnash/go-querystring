@@ -326,3 +326,43 @@ func TestTagParsing(t *testing.T) {
 		}
 	}
 }
+
+func TestTagFormatTime(t *testing.T) {
+	name, opts := parseTag("field,time_format=2006-01-02 15:04:03")
+	if name != "field" {
+		t.Fatalf("name = %q, want field", name)
+	}
+	format := "2006-01-02 15:04:03"
+	has := true
+
+	f, h := opts.CheckTimeFormat()
+	if h != has || f != format {
+		t.Errorf("CheckTimeFormat get {%v %v}, want {%v %v}", f, h, format, has)
+	}
+}
+
+func TestMapAndTag(t *testing.T) {
+	s := map[string]interface{}{
+		"A": 1,
+		"B": "2",
+		"C": struct {
+			T time.Time `form:"t,time_format=2006-01-02 15:04:05"`
+		}{T: time.Date(2000, 1, 1, 12, 34, 56, 0, time.UTC)},
+		"D": map[string]interface{}{
+			"F": 123,
+		},
+	}
+	want := url.Values{
+		"A":    {"1"},
+		"B":    {"2"},
+		"C[t]": {"2000-01-01 12:34:56"},
+		"D[F]": {"123"},
+	}
+	out, err := ValuesWithTagName(s, "form")
+	if err != nil {
+		t.Errorf("Values(%v) returned error: %v", s, err)
+	}
+	if !reflect.DeepEqual(want, out) {
+		t.Errorf("Values(%q) returned %v, want %v", s, out, want)
+	}
+}

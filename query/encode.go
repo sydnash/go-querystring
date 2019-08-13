@@ -111,6 +111,19 @@ type Encoder interface {
 // Multiple fields that encode to the same URL parameter name will be included
 // as multiple URL values of the same name.
 func Values(v interface{}) (url.Values, error) {
+	return ValuesWithTagName(v, "url")
+}
+
+func ValuesWithTagName(v interface{}, tagName string) (url.Values, error) {
+	t := &TEncoder{TagName: tagName}
+	return t.Values(v)
+}
+
+type TEncoder struct {
+	TagName string
+}
+
+func (t *TEncoder) Values(v interface{}) (url.Values, error) {
 	values := make(url.Values)
 	val := reflect.ValueOf(v)
 	for val.Kind() == reflect.Ptr {
@@ -124,18 +137,54 @@ func Values(v interface{}) (url.Values, error) {
 		return values, nil
 	}
 
-	if val.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("query: Values() expects struct input. Got %v", val.Kind())
+	if val.Kind() != reflect.Struct && !isExpectMap(val) {
+		return nil, fmt.Errorf("query: Values() expects struct or map input. Got %v", val.Kind())
 	}
 
-	err := reflectValue(values, val, "")
+	err := t.reflectValue(values, val, "")
 	return values, err
+}
+
+//isExpectMap check val is the expected map which key must be string.
+func isExpectMap(val reflect.Value) bool {
+	if val.Kind() != reflect.Map {
+		return false
+	}
+	if val.Type().Key().Kind() != reflect.String {
+		return false
+	}
+	return true
 }
 
 // reflectValue populates the values parameter from the struct fields in val.
 // Embedded structs are followed recursively (using the rules defined in the
 // Values function documentation) breadth-first.
-func reflectValue(values url.Values, val reflect.Value, scope string) error {
+func (t *TEncoder) reflectValue(values url.Values, val reflect.Value, scope string) error {
+	if val.Kind() == reflect.Struct {
+		return t.reflectStruct(values, val, scope)
+	} else if val.Kind() == reflect.Map {
+		return t.reflectMap(values, val, scope)
+	}
+	return fmt.Errorf("query: Values() expects struct or map input. Got %v", val.Kind())
+}
+
+func (t *TEncoder) reflectMap(values url.Values, val reflect.Value, scope string) error {
+	keys := val.MapKeys()
+	for i := 0; i < len(keys); i++ {
+		key := keys[i]
+		name := key.Interface().(string)
+
+		sv := val.MapIndex(key)
+		opts := tagOptions{}
+
+		if err := t.addSvToValues(values, sv, name, scope, opts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *TEncoder) reflectStruct(values url.Values, val reflect.Value, scope string) error {
 	var embedded []reflect.Value
 
 	typ := val.Type()
@@ -146,7 +195,7 @@ func reflectValue(values url.Values, val reflect.Value, scope string) error {
 		}
 
 		sv := val.Field(i)
-		tag := sf.Tag.Get("url")
+		tag := sf.Tag.Get(t.TagName)
 		if tag == "-" {
 			continue
 		}
@@ -157,92 +206,105 @@ func reflectValue(values url.Values, val reflect.Value, scope string) error {
 				embedded = append(embedded, sv)
 				continue
 			}
-
 			name = sf.Name
 		}
-
-		if scope != "" {
-			name = scope + "[" + name + "]"
-		}
-
-		if opts.Contains("omitempty") && isEmptyValue(sv) {
-			continue
-		}
-
-		if sv.Type().Implements(encoderType) {
-			if !reflect.Indirect(sv).IsValid() {
-				sv = reflect.New(sv.Type().Elem())
-			}
-
-			m := sv.Interface().(Encoder)
-			if err := m.EncodeValues(name, &values); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if sv.Kind() == reflect.Slice || sv.Kind() == reflect.Array {
-			var del byte
-			if opts.Contains("comma") {
-				del = ','
-			} else if opts.Contains("space") {
-				del = ' '
-			} else if opts.Contains("semicolon") {
-				del = ';'
-			} else if opts.Contains("brackets") {
-				name = name + "[]"
-			}
-
-			if del != 0 {
-				s := new(bytes.Buffer)
-				first := true
-				for i := 0; i < sv.Len(); i++ {
-					if first {
-						first = false
-					} else {
-						s.WriteByte(del)
-					}
-					s.WriteString(valueString(sv.Index(i), opts))
-				}
-				values.Add(name, s.String())
-			} else {
-				for i := 0; i < sv.Len(); i++ {
-					k := name
-					if opts.Contains("numbered") {
-						k = fmt.Sprintf("%s%d", name, i)
-					}
-					values.Add(k, valueString(sv.Index(i), opts))
-				}
-			}
-			continue
-		}
-
-		for sv.Kind() == reflect.Ptr {
-			if sv.IsNil() {
-				break
-			}
-			sv = sv.Elem()
-		}
-
-		if sv.Type() == timeType {
-			values.Add(name, valueString(sv, opts))
-			continue
-		}
-
-		if sv.Kind() == reflect.Struct {
-			reflectValue(values, sv, name)
-			continue
-		}
-
-		values.Add(name, valueString(sv, opts))
-	}
-
-	for _, f := range embedded {
-		if err := reflectValue(values, f, scope); err != nil {
+		if err := t.addSvToValues(values, sv, name, scope, opts); err != nil {
 			return err
 		}
 	}
 
+	for _, f := range embedded {
+		if err := t.reflectValue(values, f, scope); err != nil {
+			return err
+		}
+	}
+
+	return nil
+
+}
+
+func (t *TEncoder) addSvToValues(values url.Values, sv reflect.Value, name string, scope string, opts tagOptions) error {
+	if scope != "" {
+		name = scope + "[" + name + "]"
+	}
+
+	if opts.Contains("omitempty") && isEmptyValue(sv) {
+		return nil
+	}
+
+	if sv.Type().Implements(encoderType) {
+		if !reflect.Indirect(sv).IsValid() {
+			sv = reflect.New(sv.Type().Elem())
+		}
+
+		m := sv.Interface().(Encoder)
+		if err := m.EncodeValues(name, &values); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	for sv.Kind() == reflect.Ptr || sv.Kind() == reflect.Interface {
+		if sv.IsNil() {
+			break
+		}
+		sv = sv.Elem()
+	}
+
+	if sv.Type() == timeType {
+		values.Add(name, valueString(sv, opts))
+		return nil
+	}
+
+	if sv.Kind() == reflect.Struct || isExpectMap(sv) {
+		if err := t.reflectValue(values, sv, name); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if sv.Kind() == reflect.Slice || sv.Kind() == reflect.Array {
+		_ = processArrayLike(sv, values, name, opts)
+		return nil
+	}
+
+	values.Add(name, valueString(sv, opts))
+	return nil
+}
+
+func processArrayLike(sv reflect.Value, values url.Values, name string, opts tagOptions) error {
+	var del byte
+	if opts.Contains("comma") {
+		del = ','
+	} else if opts.Contains("space") {
+		del = ' '
+	} else if opts.Contains("semicolon") {
+		del = ';'
+	} else if opts.Contains("brackets") {
+		name = name + "[]"
+	}
+
+	if del != 0 {
+		s := new(bytes.Buffer)
+		first := true
+		for i := 0; i < sv.Len(); i++ {
+			if first {
+				first = false
+			} else {
+				s.WriteByte(del)
+			}
+			s.WriteString(valueString(sv.Index(i), opts))
+		}
+		values.Add(name, s.String())
+	} else {
+		for i := 0; i < sv.Len(); i++ {
+			k := name
+			if opts.Contains("numbered") {
+				k = fmt.Sprintf("%s%d", name, i)
+			}
+			values.Add(k, valueString(sv.Index(i), opts))
+		}
+	}
 	return nil
 }
 
@@ -264,6 +326,9 @@ func valueString(v reflect.Value, opts tagOptions) string {
 
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
+		if format, has := opts.CheckTimeFormat(); has && format != "" {
+			return t.Format(format)
+		}
 		if opts.Contains("unix") {
 			return strconv.FormatInt(t.Unix(), 10)
 		}
@@ -317,4 +382,14 @@ func (o tagOptions) Contains(option string) bool {
 		}
 	}
 	return false
+}
+
+func (o tagOptions) CheckTimeFormat() (string, bool) {
+	for _, s := range o {
+		timeFormat := "time_format="
+		if strings.HasPrefix(s, timeFormat) {
+			return strings.TrimPrefix(s, timeFormat), true
+		}
+	}
+	return "", false
 }
